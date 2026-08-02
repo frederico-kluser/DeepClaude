@@ -1,0 +1,13 @@
+# Credenciais
+*.key
+*.pem
+*.p12
+secrets*
+.env
+credentials*
+
+# OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~

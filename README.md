@@ -27,11 +27,53 @@ Flags:
 
 | Flag | Efeito |
 |---|---|
+| `--name=<nome>` | Nome da **área** — define o dir e o comando |
+| `--dir=<caminho>` | Dir da área explícito (precede `--name`) |
+| `--command=<nome>` | Nome do comando gerado |
 | `--key=sk-...` | Fornece a chave DeepSeek (senão pergunta) |
 | `--no-key` | Pula a chave — configure depois |
+| `--skills-from=<dir>` | Área de onde copiar skills (default: `~/.claude`) |
+| `--no-skills` | Não copia skills/commands |
 | `-h`, `--help` | Ajuda |
 
 A chave também sai de `DEEPSEEK_CLAUDE_API_KEY` no ambiente.
+
+## Áreas — várias instalações lado a lado
+
+Uma **área** é um `CLAUDE_CONFIG_DIR` próprio: chave, histórico, settings e skills separados. O binário `claude` é **compartilhado** por todas — o isolamento é por variável de ambiente, nunca por reinstalar nada.
+
+```bash
+./install-deepclaude.sh                      # ~/.claude-deepseek            → deepclaude
+./install-deepclaude.sh --name=trabalho      # ~/.claude-deepseek-trabalho   → deepclaude-trabalho
+./install-deepclaude.sh --name=pessoal       # ~/.claude-deepseek-pessoal    → deepclaude-pessoal
+```
+
+Cada execução com um `--name` novo cria uma área **nova**, com chave e histórico próprios, e um comando próprio. Nenhuma delas interfere nas outras.
+
+### O que o instalador se recusa a fazer
+
+| Situação | Comportamento |
+|---|---|
+| Área alvo é `~/.claude` (a default do Claude Code) | **Aborta.** Essa é a área onde o `claude` sem env var guarda seu login — o instalador nunca escreve nela |
+| Dir alvo já tem login de outra conta (`.credentials.json`, Kimi, `auth.json`) | **Aborta.** Misturar dois cadastros no mesmo dir é o erro que mais dói |
+| O comando alvo já existe e é um **symlink** | **Aborta** e mostra o alvo. `cat >` através de symlink sobrescreve o arquivo apontado, não o link — isso já destruiria um script versionado em outro repo |
+| O comando alvo existe como arquivo comum | Faz **backup** `.bak-<timestamp>` antes de gerar |
+
+O `claude` que já estiver instalado **não é substituído nem atualizado** — é apenas reusado.
+
+### Integração com seletores de conta
+
+Se a máquina tiver o CLI `claude-contas` (o seletor por trás de funções como `asd`), a área nova é registrada automaticamente com tipo `dsclaude`, e passa a aparecer no menu:
+
+```bash
+asd -a deepseek-trabalho
+```
+
+Sem esse CLI, nada muda — a instalação funciona pelo comando direto.
+
+### Skills
+
+As skills da área de origem são espelhadas por symlink resolvendo o **alvo canônico**, não o caminho dentro da origem. Se `~/.claude/skills/foo` já é um link para `~/Projects/foo`, a área nova aponta direto para `~/Projects/foo` — sem criar uma cadeia que quebraria se a origem sumisse. A área de origem é **somente lida**.
 
 ### Windows (PowerShell)
 

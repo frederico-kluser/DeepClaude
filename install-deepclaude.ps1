@@ -22,6 +22,11 @@
 
 param(
   [string]$Key = '',
+  [string]$Name = 'deepseek',
+  [string]$Dir = '',
+  [string]$Command = '',
+  [string]$SkillsFrom = '',
+  [switch]$NoSkills = $false,
   [switch]$NoKey = $false,
   [switch]$Help = $false
 )
@@ -32,11 +37,21 @@ $ErrorActionPreference = 'Stop'
 # ── Help ─────────────────────────────────────────────────────────────────────
 if ($Help) {
   Write-Host @"
-Uso: .\install-deepclaude.ps1 [-Key sk-...] [-NoKey]
+Uso: .\install-deepclaude.ps1 [opcoes]
 
-  -Key sk-...    Fornece a chave da API DeepSeek
-  -NoKey         Pula a validacao da chave (configure depois)
-  -Help          Mostra esta ajuda
+Cria uma AREA NOVA do Claude Code apontada para o DeepSeek. A area default
+(~\.claude) nunca e tocada e o `claude` existente nao e substituido.
+
+  -Name <nome>       Nome da area. Define dir e comando:
+                       (padrao)      -> ~\.claude-deepseek       + deepclaude
+                       -Name x       -> ~\.claude-deepseek-x     + deepclaude-x
+  -Dir <caminho>     Dir da area explicito (precede -Name)
+  -Command <nome>    Nome do comando gerado
+  -Key sk-...        Fornece a chave da API DeepSeek
+  -NoKey             Pula a validacao da chave (configure depois)
+  -SkillsFrom <dir>  Area de onde copiar skills (default: ~\.claude)
+  -NoSkills          Nao copia skills/commands
+  -Help              Mostra esta ajuda
 
 A chave tambem pode ser fornecida via env var:
   `$env:DEEPSEEK_CLAUDE_API_KEY = "sk-..." ; .\install-deepclaude.ps1
@@ -54,11 +69,63 @@ function Write-Warning2 { Write-Host "⚠ $args" -ForegroundColor Yellow }
 function Write-Err     { Write-Host "× $args" -ForegroundColor Red }
 function Write-Header  { Write-Host "`n═══ $args ═══" -ForegroundColor Blue }
 
-# ── Helpers de caminho ──────────────────────────────────────────────────────
-$Script:ConfigDir   = Join-Path $env:USERPROFILE '.claude-deepseek'
-$Script:BinDir      = Join-Path $env:USERPROFILE '.local\bin'
-$Script:LauncherPath = Join-Path $BinDir 'deepclaude.cmd'
-$Script:MainClaudeCfg = Join-Path $env:USERPROFILE '.claude'
+# ── Areas de instalacao ─────────────────────────────────────────────────────
+# Uma "area" e um CLAUDE_CONFIG_DIR proprio. O binario `claude` e COMPARTILHADO
+# entre todas; o isolamento e por variavel de ambiente, nunca por reinstalar.
+#
+# 🔴 A area default (~\.claude) e INTOCAVEL: e onde o `claude` sem env var
+# guarda login e historico. Escrever ali seria o "replace" que este projeto
+# existe para evitar. Cada -Name cria uma area NOVA.
+$Script:DefaultArea = 'deepseek'
+
+if ($Name -notmatch '^[A-Za-z0-9._-]+$') {
+  Write-Host "Nome de area invalido: '$Name' - use so letras, numeros, . _ -" -ForegroundColor Red
+  exit 1
+}
+
+if ($Dir) {
+  $Script:ConfigDir = $Dir.Replace('~', $env:USERPROFILE)
+}
+elseif ($Name -eq $Script:DefaultArea) {
+  $Script:ConfigDir = Join-Path $env:USERPROFILE '.claude-deepseek'   # compat
+}
+else {
+  $Script:ConfigDir = Join-Path $env:USERPROFILE ".claude-deepseek-$Name"
+}
+
+if ($Command)                        { $Script:LauncherName = "$Command.cmd" }
+elseif ($Name -eq $Script:DefaultArea) { $Script:LauncherName = 'deepclaude.cmd' }
+else                                 { $Script:LauncherName = "deepclaude-$Name.cmd" }
+
+$Script:BinDir       = Join-Path $env:USERPROFILE '.local\bin'
+$Script:LauncherPath = Join-Path $BinDir $Script:LauncherName
+# Area de ORIGEM das skills — somente leitura, nada e escrito nela.
+if ($SkillsFrom) { $Script:MainClaudeCfg = $SkillsFrom.Replace('~', $env:USERPROFILE) }
+else             { $Script:MainClaudeCfg = Join-Path $env:USERPROFILE '.claude' }
+
+# ── Gate: nunca a area default ──────────────────────────────────────────────
+function Assert-AreaIsSafe {
+  $defaultArea = Join-Path $env:USERPROFILE '.claude'
+  $a = $Script:ConfigDir.TrimEnd('\', '/')
+  $b = $defaultArea.TrimEnd('\', '/')
+  if ($a -ieq $b) {
+    Write-Err "Recusado: '$Script:ConfigDir' e a area DEFAULT do Claude Code."
+    Write-Err 'Este instalador cria uma area NOVA e nunca substitui a default.'
+    Write-Err 'Use -Name <nome> ou -Dir <caminho> para escolher outra.'
+    exit 1
+  }
+
+  # Anti-mistura: dir que ja tem login de outra conta.
+  if (Test-Path $Script:ConfigDir) {
+    $hasClaudeLogin = Test-Path (Join-Path $Script:ConfigDir '.credentials.json')
+    $hasDsKey       = Test-Path (Join-Path $Script:ConfigDir 'deepseek.key')
+    if ($hasClaudeLogin -and -not $hasDsKey) {
+      Write-Err "Recusado: '$Script:ConfigDir' ja contem login de outra conta."
+      Write-Err 'Reaproveitar esse dir misturaria dois cadastros. Escolha outro -Dir.'
+      exit 1
+    }
+  }
+}
 
 # ── Verificacao de pre-requisitos ────────────────────────────────────────────
 function Check-Prereqs {
@@ -348,7 +415,7 @@ REM do cmd e o `claude` original passaria a falar com a DeepSeek na mesma
 REM janela. O isolamento desta instalacao depende desta linha.
 setlocal
 
-if not defined DEEPCLAUDE_DIR       set "DEEPCLAUDE_DIR=%USERPROFILE%\.claude-deepseek"
+if not defined DEEPCLAUDE_DIR       set "DEEPCLAUDE_DIR=__DEEPCLAUDE_AREA_DIR__"
 if not defined DEEPCLAUDE_MODEL     set "DEEPCLAUDE_MODEL=deepseek-v4-flash[1m]"
 if not defined DEEPCLAUDE_FABLE_MODEL set "DEEPCLAUDE_FABLE_MODEL=deepseek-v4-pro[1m]"
 if not defined DEEPCLAUDE_BASE_URL  set "DEEPCLAUDE_BASE_URL=https://api.deepseek.com/anthropic"
@@ -408,6 +475,18 @@ set "ANTHROPIC_API_KEY="
 claude --dangerously-skip-permissions --effort max%ARGS%
 exit /b %ERRORLEVEL%
 '@
+
+  # O here-string e literal (@'...'@) de proposito: o .cmd esta cheio de %VAR% e
+  # nao pode sofrer interpolacao do PowerShell. O unico valor dinamico entra por
+  # substituicao de placeholder, para a area escolhida em -Name/-Dir valer.
+  $launcherContent = $launcherContent.Replace('__DEEPCLAUDE_AREA_DIR__', $Script:ConfigDir)
+
+  # Nao sobrescrever cegamente um launcher existente.
+  if (Test-Path $LauncherPath) {
+    $bak = "$LauncherPath.bak-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Copy-Item $LauncherPath $bak -Force
+    Write-Warning2 "Launcher existente salvo em $bak"
+  }
 
   Set-Content -Path $LauncherPath -Value $launcherContent
   Write-Ok "Launcher criado: $LauncherPath"
@@ -542,6 +621,13 @@ Write-Host '╚═════════════════════�
 Write-Host ''
 
 Write-Ok 'Sistema: Windows (PowerShell)'
+
+# 0. Area — resolve e valida ANTES de escrever qualquer coisa
+Write-Header 'Area de instalacao'
+Write-Info "Area:     $Script:ConfigDir"
+Write-Info "Comando:  $Script:LauncherName"
+Write-Info 'Default do Claude Code (~\.claude): intocada'
+Assert-AreaIsSafe
 
 # 1. Pre-requisitos
 Check-Prereqs

@@ -69,38 +69,116 @@ detect_os() {
   printf '%s' "$os"
 }
 
-# ── Helpers de caminho ──────────────────────────────────────────────────────
+# ── Áreas de instalação ─────────────────────────────────────────────────────
+# Uma "área" é um CLAUDE_CONFIG_DIR próprio: chave, histórico, settings e skills
+# separados. O binário `claude` é COMPARTILHADO entre todas — o isolamento é por
+# env var, nunca por reinstalar nada.
+#
+# 🔴 A área default do Claude Code (~/.claude) é INTOCÁVEL por este instalador.
+# Ela é onde o `claude` sem env var guarda login e histórico do usuário; escrever
+# ali seria exatamente o "replace" que este projeto existe para evitar.
+#
+# Cada execução com `--name` cria uma área NOVA, no modelo do seletor `asd`
+# (~/.config/claude-contas/contas.conf), onde toda conta é um `~/.claude-<algo>`
+# e nenhuma é o `~/.claude`.
+DEFAULT_AREA='deepseek'
+AREA_NAME="$DEFAULT_AREA"   # sobrescrito por --name
+AREA_DIR=''                 # sobrescrito por --dir (tem precedência)
+LAUNCHER_NAME=''            # derivado do nome da área
+
 config_dir() {
-  # Diretório de config isolado da conta deepclaude
-  case "$OS" in
-    windows-gitbash) printf '%s/.claude-deepseek' "$HOME" ;;
-    *)               printf '%s/.claude-deepseek' "$HOME" ;;
-  esac
+  if [[ -n "$AREA_DIR" ]]; then
+    printf '%s' "$AREA_DIR"
+  elif [[ "$AREA_NAME" == "$DEFAULT_AREA" ]]; then
+    printf '%s/.claude-deepseek' "$HOME"       # compat com instalações antigas
+  else
+    printf '%s/.claude-deepseek-%s' "$HOME" "$AREA_NAME"
+  fi
 }
 
 bin_dir() {
-  # Diretório onde o launcher será instalado
   case "$OS" in
     windows-gitbash) printf '%s' "$HOME" ;;  # %USERPROFILE% é o HOME do Git Bash
-    macos)           printf '%s/.local/bin' "$HOME" ;;
     *)               printf '%s/.local/bin' "$HOME" ;;
   esac
 }
 
-launcher_path() {
-  case "$OS" in
-    windows-gitbash) printf '%s/deepclaude' "$(bin_dir)" ;;
-    *)               printf '%s/deepclaude' "$(bin_dir)" ;;
-  esac
+launcher_name() {
+  if [[ -n "$LAUNCHER_NAME" ]]; then
+    printf '%s' "$LAUNCHER_NAME"
+  elif [[ "$AREA_NAME" == "$DEFAULT_AREA" ]]; then
+    printf 'deepclaude'
+  else
+    printf 'deepclaude-%s' "$AREA_NAME"
+  fi
 }
 
-main_claude_config() {
-  # Config dir da instalação principal do Claude (a original)
-  case "$OS" in
-    windows-gitbash) printf '%s/.claude' "$HOME" ;;
-    macos)           printf '%s/.claude' "$HOME" ;;
-    *)               printf '%s/.claude' "$HOME" ;;
-  esac
+launcher_path() { printf '%s/%s' "$(bin_dir)" "$(launcher_name)"; }
+
+# Área de onde copiar skills/commands. NÃO é escrita — só lida.
+skills_source_dir() {
+  if [[ -n "${ARG_SKILLS_FROM:-}" ]]; then
+    printf '%s' "${ARG_SKILLS_FROM/#\~/$HOME}"
+  else
+    printf '%s/.claude' "$HOME"
+  fi
+}
+
+# ── Gates que protegem a instalação existente ───────────────────────────────
+assert_area_is_safe() {
+  local cfg="$1"
+  local default_area="$HOME/.claude"
+
+  # 1. Nunca a área default.
+  local cfg_real default_real
+  cfg_real="$(readlink -f "$cfg" 2>/dev/null || printf '%s' "$cfg")"
+  default_real="$(readlink -f "$default_area" 2>/dev/null || printf '%s' "$default_area")"
+  if [[ "$cfg_real" == "$default_real" ]]; then
+    err "Recusado: '$cfg' é a área DEFAULT do Claude Code."
+    err "Este instalador cria uma área NOVA e nunca substitui a default."
+    err "Use --name=<nome> ou --dir=<caminho> para escolher outra."
+    exit 1
+  fi
+
+  # 2. Nunca um dir que já tem credencial de OUTRO agente — mesmo gate do
+  #    `claude-contas add`, porque misturar cadastro é o erro que mais dói:
+  #    dois logins no mesmo dir e nenhum dos dois funciona direito depois.
+  if [[ -d "$cfg" ]]; then
+    local foreign=''
+    [[ -e "$cfg/.credentials.json" ]]            && foreign='.credentials.json (login Claude)'
+    [[ -e "$cfg/credentials/kimi-code.json" ]]   && foreign='credenciais Kimi'
+    [[ -e "$cfg/auth.json" ]]                    && foreign='auth.json'
+    if [[ -n "$foreign" ]] && [[ ! -e "$cfg/deepseek.key" ]]; then
+      err "Recusado: '$cfg' já contém $foreign de outra conta."
+      err "Reaproveitar esse dir misturaria dois cadastros. Escolha outro --dir."
+      exit 1
+    fi
+  fi
+}
+
+assert_launcher_is_safe() {
+  local launcher="$1"
+
+  # 🔴 `cat > arquivo` SEGUE symlink e sobrescreve o ALVO. Se o launcher já é um
+  # symlink (caso real: ~/.local/bin/deepclaude -> ~/Projects/config/deepclaude.sh),
+  # gerar por cima destruiria silenciosamente o arquivo apontado — que pode ser
+  # um script versionado em outro repositório.
+  if [[ -L "$launcher" ]]; then
+    local target; target="$(readlink -f "$launcher" 2>/dev/null || readlink "$launcher")"
+    err "Recusado: '$launcher' é um symlink para:"
+    err "    $target"
+    err "Gerar o launcher por cima sobrescreveria ESSE arquivo, não o link."
+    info "Opções:"
+    info "  - instalar com outro nome:  --name=<nome>   (vira deepclaude-<nome>)"
+    info "  - remover o link primeiro:  rm '$launcher'"
+    exit 1
+  fi
+
+  # Arquivo comum já existente: faz backup em vez de perder o conteúdo.
+  if [[ -e "$launcher" ]]; then
+    local bak="${launcher}.bak-$(date +%Y%m%d%H%M%S)"
+    cp -p "$launcher" "$bak" && warn "Launcher existente salvo em $bak"
+  fi
 }
 
 # ── Verificação de pré-requisitos ───────────────────────────────────────────
@@ -368,6 +446,14 @@ mirror_skills_and_commands() {
 
   header 'Skills e commands globais'
 
+  # A área de origem é SÓ LIDA — nada é escrito nela em nenhum caminho.
+  if [[ ! -d "$src" ]]; then
+    info "Área de origem '$src' não existe — skills/commands ficam vazios."
+    info "Adicione depois em $dst/skills/, ou reinstale com --skills-from=<dir>."
+    return 0
+  fi
+  info "Origem (somente leitura): $src"
+
   local mirrored_skills=0 mirrored_commands=0
 
   # Skills
@@ -388,8 +474,13 @@ mirror_skills_and_commands() {
           cp -r "$skill_dir" "$target"
           ;;
         *)
-          # Linux/macOS: symlink para que updates na fonte propaguem
-          ln -s "$skill_dir" "$target"
+          # Symlink para o alvo CANÔNICO, não para o caminho dentro da área de
+          # origem. Skills globais costumam já ser symlinks (ex.:
+          # ~/.claude/skills/foo -> ~/Projects/foo); linkar para o caminho da
+          # origem criaria uma CADEIA passando por ela, e a área nova quebraria
+          # se a origem fosse removida. `readlink -f` corta o intermediário.
+          local real; real="$(readlink -f "$skill_dir" 2>/dev/null || printf '%s' "$skill_dir")"
+          ln -s "$real" "$target"
           ;;
       esac
       ((mirrored_skills++))
@@ -414,7 +505,9 @@ mirror_skills_and_commands() {
 
       case "$OS" in
         windows-gitbash) cp "$cmd_file" "$target" ;;
-        *)               ln -s "$cmd_file" "$target" ;;
+        *)
+          local real_cmd; real_cmd="$(readlink -f "$cmd_file" 2>/dev/null || printf '%s' "$cmd_file")"
+          ln -s "$real_cmd" "$target" ;;
       esac
       ((mirrored_commands++))
     done
@@ -553,6 +646,41 @@ DEEPCLAUDE_EOF
   ok "Launcher criado: $launcher"
 }
 
+# ── Integração opcional com o seletor de contas ─────────────────────────────
+# Em máquinas que usam o `claude-contas` (o seletor por trás do `asd`), uma área
+# só aparece no menu se estiver no registro. Sem isso a instalação funciona pelo
+# comando direto, mas fica invisível no seletor — que é onde o usuário escolhe.
+register_in_claude_contas() {
+  local cfg="$1"
+
+  command -v claude-contas &>/dev/null || return 0
+
+  header 'Seletor de contas (claude-contas)'
+
+  local conta="deepseek-${AREA_NAME}"
+  [[ "$AREA_NAME" == "$DEFAULT_AREA" ]] && conta='deepseek-claude'
+
+  if claude-contas path "$conta" &>/dev/null; then
+    ok "Conta '$conta' já registrada — nada a fazer."
+    return 0
+  fi
+
+  # `add` do claude-contas recusa dir com credencial (gate anti-mistura). Como a
+  # chave já foi gravada, registramos direto no arquivo — mesmo formato do `add`.
+  local conf="$HOME/.config/claude-contas/contas.conf"
+  if [[ -f "$conf" ]]; then
+    if grep -qE "^[[:space:]]*${conta}[[:space:]]" "$conf" 2>/dev/null; then
+      ok "Conta '$conta' já consta em $conf"
+    else
+      printf '%-15s %-28s %s\n' "$conta" "$cfg" 'dsclaude' >> "$conf"
+      ok "Conta '$conta' registrada — aparece em: asd -a $conta"
+    fi
+  else
+    info "Registro do claude-contas não encontrado ($conf) — pulando."
+    info "Depois, se quiser: claude-contas add $conta '$cfg' dsclaude"
+  fi
+}
+
 # ── Verificação de PATH ─────────────────────────────────────────────────────
 check_path() {
   local bin="$1"
@@ -611,7 +739,7 @@ print_summary() {
 
   say ""
   say "${BOLD}Resumo:${NC}"
-  say "  Comando:      ${CYAN}deepclaude${NC}"
+  say "  Comando:      ${CYAN}$(launcher_name)${NC}"
   say "  Config dir:   ${CYAN}${cfg}${NC}   ${BOLD}(isolado — a instalação original do Claude não foi tocada)${NC}"
   say "  Chave:        ${CYAN}${cfg}/deepseek.key${NC}"
   say "  Endpoint:     https://api.deepseek.com/anthropic"
@@ -654,32 +782,69 @@ print_summary() {
 # main
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
-  local ARG_KEY='' ARG_NO_KEY=false
+  local ARG_KEY='' ARG_NO_KEY=false ARG_SKILLS_FROM='' ARG_NO_SKILLS=false
 
   # Parse args
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --key=*)   ARG_KEY="${1#*=}"; shift ;;
-      --key)     ARG_KEY="$2"; shift 2 ;;
-      --no-key)  ARG_NO_KEY=true; shift ;;
+      --key=*)         ARG_KEY="${1#*=}"; shift ;;
+      --key)           ARG_KEY="$2"; shift 2 ;;
+      --no-key)        ARG_NO_KEY=true; shift ;;
+      --name=*)        AREA_NAME="${1#*=}"; shift ;;
+      --name)          AREA_NAME="$2"; shift 2 ;;
+      --dir=*)         AREA_DIR="${1#*=}"; shift ;;
+      --dir)           AREA_DIR="$2"; shift 2 ;;
+      --command=*)     LAUNCHER_NAME="${1#*=}"; shift ;;
+      --command)       LAUNCHER_NAME="$2"; shift 2 ;;
+      --skills-from=*) ARG_SKILLS_FROM="${1#*=}"; shift ;;
+      --skills-from)   ARG_SKILLS_FROM="$2"; shift 2 ;;
+      --no-skills)     ARG_NO_SKILLS=true; shift ;;
       -h|--help)
-        printf 'Uso: %s [--key=sk-...] [--no-key]\n' "$0"
-        printf '\n'
-        printf '  --key=sk-...   Fornece a chave da API DeepSeek\n'
-        printf '  --no-key       Pula a validação da chave (configure depois)\n'
-        printf '  -h, --help     Mostra esta ajuda\n'
-        printf '\n'
-        printf 'A chave também pode ser fornecida via env var:\n'
-        printf '  DEEPSEEK_CLAUDE_API_KEY=sk-... %s\n' "$0"
+        cat <<HELP
+Uso: $0 [opções]
+
+Cria uma ÁREA NOVA do Claude Code apontada para o DeepSeek. A área default
+(~/.claude) nunca é tocada, e o binário 'claude' existente não é substituído —
+ele é reusado, e o desvio é só por variável de ambiente.
+
+  --name=<nome>       Nome da área. Define o dir e o comando:
+                        (padrão)  -> ~/.claude-deepseek        + 'deepclaude'
+                        --name=x  -> ~/.claude-deepseek-x      + 'deepclaude-x'
+  --dir=<caminho>     Dir da área explícito (tem precedência sobre --name)
+  --command=<nome>    Nome do comando gerado (default: derivado de --name)
+
+  --key=sk-...        Chave da API DeepSeek (senão pergunta)
+  --no-key            Pula a chave — configure depois
+
+  --skills-from=<dir> Área de onde copiar skills/commands (default: ~/.claude)
+  --no-skills         Não copia skills/commands
+
+  -h, --help          Esta ajuda
+
+A chave também sai da env:  DEEPSEEK_CLAUDE_API_KEY=sk-... $0
+
+Exemplos:
+  $0                              # área padrão, comando 'deepclaude'
+  $0 --name=trabalho              # ~/.claude-deepseek-trabalho, 'deepclaude-trabalho'
+  $0 --dir=~/.claude-ds2 --command=ds2
+HELP
         exit 0
         ;;
       *)
         err "Argumento desconhecido: $1"
-        printf 'Use --help para ver as opções.\n'
+        info 'Use --help para ver as opções.'
         exit 1
         ;;
     esac
   done
+
+  # Normaliza e valida o nome da área (vira nome de dir e de comando).
+  case "$AREA_NAME" in
+    ''|*[!A-Za-z0-9._-]*)
+      err "Nome de área inválido: '$AREA_NAME' — use só letras, números, . _ -"
+      exit 1 ;;
+  esac
+  AREA_DIR="${AREA_DIR/#\~/$HOME}"
 
   say ""
   say "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗"
@@ -698,8 +863,14 @@ main() {
   CLAUDE_BIN="$(find_or_install_claude)"
   # claude binary path stored in CLAUDE_BIN but we use PATH resolution at runtime
 
-  # 4. Config dir
+  # 4. Área — resolve e valida ANTES de escrever qualquer coisa
   CFG="$(config_dir)"
+  header 'Área de instalação'
+  info "Área:     $CFG"
+  info "Comando:  $(launcher_name)"
+  say "${BLUE}ℹ${NC} Default do Claude Code (~/.claude): ${BOLD}intocada${NC}"
+  assert_area_is_safe "$CFG"
+  assert_launcher_is_safe "$(launcher_path)"
 
   # 5. DeepSeek API key
   if [[ "$ARG_NO_KEY" == true ]]; then
@@ -732,15 +903,21 @@ main() {
   # 6. Config dir + subdirs
   setup_config_dir "$CFG"
 
-  # 7. Mirror skills/commands from main installation
-  MAIN_CFG="$(main_claude_config)"
-  mirror_skills_and_commands "$MAIN_CFG" "$CFG"
+  # 7. Espelha skills/commands (LEITURA apenas da área de origem)
+  if [[ "$ARG_NO_SKILLS" == true ]]; then
+    info 'Pulando skills/commands (--no-skills).'
+  else
+    mirror_skills_and_commands "$(skills_source_dir)" "$CFG"
+  fi
 
   # 8. Create launcher
   BIN="$(bin_dir)"
   create_launcher "$CFG" "$BIN"
 
-  # 9. PATH check
+  # 9. Registrar no seletor de contas, se a máquina tiver um
+  register_in_claude_contas "$CFG"
+
+  # 10. PATH check
   check_path "$BIN"
 
   # 10. Test

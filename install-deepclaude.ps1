@@ -4,7 +4,7 @@
   Instalador cross-platform do deepclaude — Windows nativo (PowerShell)
 .DESCRIPTION
   Instala e configura o binário OFICIAL do Claude Code com o backend trocado
-  para o DeepSeek V4 Pro via endpoint Anthropic-compatível. Cria uma segunda
+  para o DeepSeek via endpoint Anthropic-compatível. Cria uma segunda
   instalação ISOLADA (sem quebrar a original) e expõe o comando `deepclaude`.
 
   Contraparte Linux/macOS: install-deepclaude.sh
@@ -154,47 +154,84 @@ function Test-DeepSeekKey {
 
   Write-Info 'Validando chave DeepSeek...'
 
-  try {
-    $response = Invoke-RestMethod -Uri 'https://api.deepseek.com/user/balance' `
-      -Headers @{ Authorization = "Bearer $KeyToTest" } `
-      -StatusCodeVariable 'httpCode' `
-      -SkipHttpErrorCheck `
-      -TimeoutSec 15
+  $uri     = 'https://api.deepseek.com/user/balance'
+  $headers = @{ Authorization = "Bearer $KeyToTest" }
+  $code    = 0
+  $body    = $null
 
-    if ($httpCode -eq 200) {
-      if ($response.is_active) {
-        Write-Ok 'Chave valida √'
-        if ($response.total_balance) {
-          Write-Info "Saldo: $($response.total_balance)"
-        }
-        return $true
-      }
-      Write-Warning2 'Resposta 200 mas campo is_active ausente — prosseguindo...'
+  # 🔴 -StatusCodeVariable e -SkipHttpErrorCheck só existem no PowerShell 7+.
+  # No 5.1 — que é o padrão do Windows 10/11 e o mínimo que este script promete
+  # suportar — eles dão erro de binding de parâmetro, o erro caía no catch
+  # genérico com $_.Exception.Response nulo e a função devolvia $true.
+  # Resultado: no Windows "de fábrica" a chave NUNCA era validada de verdade.
+  if ($PSVersionTable.PSVersion.Major -ge 7) {
+    try {
+      $body = Invoke-RestMethod -Uri $uri -Headers $headers `
+        -StatusCodeVariable 'code' -SkipHttpErrorCheck -TimeoutSec 15
+    }
+    catch {
+      Write-Warning2 "Erro de rede ao validar: $_"
+      Write-Warning2 'A chave pode funcionar mesmo assim - prosseguindo.'
       return $true
     }
   }
-  catch {
-    if ($_.Exception.Response.StatusCode -eq 401) {
+  else {
+    try {
+      $resp = Invoke-WebRequest -Uri $uri -Headers $headers -TimeoutSec 15 -UseBasicParsing
+      $code = [int]$resp.StatusCode
+      $body = $resp.Content | ConvertFrom-Json
+    }
+    catch {
+      if ($_.Exception.Response) {
+        $code = [int]$_.Exception.Response.StatusCode
+      }
+      else {
+        Write-Warning2 "Erro de rede ao validar: $_"
+        Write-Warning2 'A chave pode funcionar mesmo assim - prosseguindo.'
+        return $true
+      }
+    }
+  }
+
+  switch ($code) {
+    200 {
+      if ($body -and $body.is_active) {
+        Write-Ok 'Chave valida'
+        $bal = $null
+        if ($body.balance_infos -and $body.balance_infos.Count -gt 0) {
+          $bal = "$($body.balance_infos[0].currency) $($body.balance_infos[0].total_balance)"
+        }
+        if ($bal) { Write-Info "Saldo: $bal" }
+        return $true
+      }
+      Write-Warning2 'Resposta 200 mas is_active ausente - prosseguindo...'
+      return $true
+    }
+    401 {
       Write-Err 'Chave INVALIDA (401 Unauthorized).'
       Write-Err 'Verifique se a chave esta correta e nao expirou.'
       Write-Info 'Obtenha uma nova em: https://platform.deepseek.com/api_keys'
       return $false
     }
-    if ($_.Exception.Response.StatusCode -eq 403) {
-      Write-Err 'Acesso negado (403). A conta pode estar suspensa ou sem saldo.'
-      return $false
-    }
-    if ($_.Exception.Response.StatusCode -eq 429) {
-      Write-Warning2 'Rate-limited (429) — nao foi possivel validar agora. Prosseguindo...'
+    402 {
+      # 402 != 401: a chave foi ACEITA, o que falta e saldo.
+      Write-Warning2 '402 Insufficient Balance - a chave e VALIDA, falta saldo.'
+      Write-Info 'Recarregue em: https://platform.deepseek.com/top_up'
       return $true
     }
-    Write-Warning2 "Erro na validacao: $_"
-    Write-Warning2 'A chave pode funcionar mesmo assim — prosseguindo.'
-    return $true
+    403 {
+      Write-Err 'Acesso negado (403). A conta pode estar suspensa.'
+      return $false
+    }
+    429 {
+      Write-Warning2 'Rate-limited (429) - nao deu para validar agora. Prosseguindo...'
+      return $true
+    }
+    default {
+      Write-Warning2 "Resposta inesperada (HTTP $code) - prosseguindo..."
+      return $true
+    }
   }
-
-  Write-Warning2 'Resposta inesperada — prosseguindo...'
-  return $true
 }
 
 function Save-DeepSeekKey {
@@ -294,37 +331,82 @@ function New-Launcher {
   # .cmd para Windows (batch) — compatível com cmd.exe, PowerShell e Git Bash
   $launcherContent = @'
 @echo off
-REM deepclaude — Claude Code com backend DeepSeek V4 Pro
-REM Gerado por install-deepclaude.ps1 — nao edite manualmente.
-REM Para atualizar a config, rode install-deepclaude.ps1 novamente.
+REM deepclaude - Claude Code oficial com o cerebro do DeepSeek.
+REM Gerado por install-deepclaude.ps1 - rode o instalador de novo para atualizar.
+REM
+REM Padrao: deepseek-v4-flash[1m]  |  slot fable: deepseek-v4-pro[1m]
+REM O alias `deepseek-v4-flash` serve o build 0731 (uso de ferramenta) e o
+REM `deepseek-v4-pro` serve o 0813. Para agente de terminal o flash ganha nos
+REM sub-indices independentes (agentic 48,4 x 37,8) e custa 1/3.
+REM Trocar: `/model fable` dentro da sessao, ou `deepclaude --pro`.
+REM
+REM Nomes que NAO existem nesta API (HTTP 400): deepseek-v4-flash-0731,
+REM deepseek-v4-pro-0813, deepseek/deepseek-*. Os dois ultimos sao do OpenRouter.
 
-set CONFIG_DIR=%USERPROFILE%\.claude-deepseek
+REM 🔴 setlocal e OBRIGATORIO: sem ele as variaveis abaixo VAZAM para a sessao
+REM do cmd e o `claude` original passaria a falar com a DeepSeek na mesma
+REM janela. O isolamento desta instalacao depende desta linha.
+setlocal
 
-REM Resolver chave: env var → arquivo
-if defined DEEPSEEK_CLAUDE_API_KEY (
-    set DSKEY=%DEEPSEEK_CLAUDE_API_KEY%
-    goto :key_found
+if not defined DEEPCLAUDE_DIR       set "DEEPCLAUDE_DIR=%USERPROFILE%\.claude-deepseek"
+if not defined DEEPCLAUDE_MODEL     set "DEEPCLAUDE_MODEL=deepseek-v4-flash[1m]"
+if not defined DEEPCLAUDE_FABLE_MODEL set "DEEPCLAUDE_FABLE_MODEL=deepseek-v4-pro[1m]"
+if not defined DEEPCLAUDE_BASE_URL  set "DEEPCLAUDE_BASE_URL=https://api.deepseek.com/anthropic"
+if not defined DEEPCLAUDE_MAX_CONTEXT_TOKENS set "DEEPCLAUDE_MAX_CONTEXT_TOKENS=1048576"
+
+set "CONFIG_DIR=%DEEPCLAUDE_DIR%"
+set "MODEL=%DEEPCLAUDE_MODEL%"
+
+REM Parse de --pro. O `shift` do batch NAO altera %*, entao a lista de
+REM argumentos precisa ser reconstruida a mao. Usa-se %1 (com aspas) e nao %~1
+REM para preservar argumentos com espaco.
+set "ARGS="
+:dc_parse
+if "%~1"=="" goto dc_parsed
+if /i "%~1"=="--pro" goto dc_setpro
+set "ARGS=%ARGS% %1"
+shift
+goto dc_parse
+:dc_setpro
+set "MODEL=deepseek-v4-pro[1m]"
+echo deepclaude: sessao no deepseek-v4-pro 1>&2
+shift
+goto dc_parse
+:dc_parsed
+
+if not defined DEEPCLAUDE_HAIKU_MODEL set "DEEPCLAUDE_HAIKU_MODEL=%MODEL%"
+
+REM Chave: env explicita vence o arquivo. DEEPSEEK_CLAUDE_API_KEY fica por
+REM compatibilidade com instalacoes anteriores a 2026-08-13.
+set "DSKEY="
+if defined DEEPCLAUDE_API_KEY      set "DSKEY=%DEEPCLAUDE_API_KEY%"
+if not defined DSKEY if defined DEEPSEEK_CLAUDE_API_KEY set "DSKEY=%DEEPSEEK_CLAUDE_API_KEY%"
+if not defined DSKEY if exist "%CONFIG_DIR%\deepseek.key" set /p DSKEY=<"%CONFIG_DIR%\deepseek.key"
+
+if not defined DSKEY (
+    echo deepclaude: sem chave da API DeepSeek. 1>&2
+    echo Grave a chave em %CONFIG_DIR%\deepseek.key 1>&2
+    echo ou defina a variavel DEEPCLAUDE_API_KEY 1>&2
+    exit /b 1
 )
-if exist "%CONFIG_DIR%\deepseek.key" (
-    set /p DSKEY=<"%CONFIG_DIR%\deepseek.key"
-    goto :key_found
-)
 
-echo deepclaude: sem chave da API DeepSeek.
-echo Grave a chave em %CONFIG_DIR%\deepseek.key
-echo ou defina a variavel DEEPSEEK_CLAUDE_API_KEY
-exit /b 1
+set "CLAUDE_CONFIG_DIR=%CONFIG_DIR%"
+set "ANTHROPIC_BASE_URL=%DEEPCLAUDE_BASE_URL%"
+set "ANTHROPIC_AUTH_TOKEN=%DSKEY%"
+set "ANTHROPIC_MODEL=%MODEL%"
+set "ANTHROPIC_DEFAULT_OPUS_MODEL=%MODEL%"
+set "ANTHROPIC_DEFAULT_SONNET_MODEL=%MODEL%"
+set "ANTHROPIC_DEFAULT_HAIKU_MODEL=%DEEPCLAUDE_HAIKU_MODEL%"
+set "ANTHROPIC_DEFAULT_FABLE_MODEL=%DEEPCLAUDE_FABLE_MODEL%"
+set "CLAUDE_CODE_SUBAGENT_MODEL=%MODEL%"
+set "CLAUDE_CODE_MAX_CONTEXT_TOKENS=%DEEPCLAUDE_MAX_CONTEXT_TOKENS%"
+REM Em batch, `set VAR=` REMOVE a variavel (equivalente ao `env -u` do Unix).
+REM O ANTHROPIC_AUTH_TOKEN ja vence na precedencia, mas remover elimina a
+REM ambiguidade se o usuario tiver uma ANTHROPIC_API_KEY no ambiente.
+set "ANTHROPIC_API_KEY="
 
-:key_found
-set CLAUDE_CONFIG_DIR=%CONFIG_DIR%
-set ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-set ANTHROPIC_AUTH_TOKEN=%DSKEY%
-set ANTHROPIC_MODEL=deepseek-v4-pro
-set ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro
-set ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro
-set ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-pro
-
-claude --dangerously-skip-permissions --effort max %*
+claude --dangerously-skip-permissions --effort max%ARGS%
+exit /b %ERRORLEVEL%
 '@
 
   Set-Content -Path $LauncherPath -Value $launcherContent
@@ -408,25 +490,43 @@ function Write-Summary {
   Write-Host "  Comando:         deepclaude" -ForegroundColor Cyan
   Write-Host "  Config dir:      $ConfigDir" -ForegroundColor Cyan
   Write-Host "  Chave:           $ConfigDir\deepseek.key" -ForegroundColor Cyan
-  Write-Host '  Backend:         DeepSeek V4 Pro'
   Write-Host '  Endpoint:        https://api.deepseek.com/anthropic'
+  Write-Host '  Modelo:          deepseek-v4-flash[1m]   (slot fable: deepseek-v4-pro[1m])' -ForegroundColor Cyan
   Write-Host ''
   Write-Host 'Proximos passos:' -ForegroundColor White
   Write-Host '  1. Reinicie o terminal ou abra uma nova janela'
   Write-Host '  2. Rode: deepclaude' -ForegroundColor Cyan
-  Write-Host '  3. Na primeira execucao, responda as perguntas de tema e trust'
+  Write-Host '  3. Na primeira execucao responda tema e trust (nao ha /login)'
   Write-Host "  4. Para adicionar skills globais, copie para $ConfigDir\skills\"
   Write-Host ''
-  Write-Host 'Limitacoes (DeepSeek V4 Pro vs Claude oficial):' -ForegroundColor White
-  Write-Host '  - Sem visao (imagens/PDFs sao degradados silenciosamente)'
-  Write-Host '  - Sem MCP remoto (server-side); MCP local/stdio funciona'
-  Write-Host '  - Sem ZDR (Zero Data Retention) — NUNCA use com codigo sensivel' -ForegroundColor Red
-  Write-Host '  - Propenso a alucinacoes (~94% no benchmark AA-Omniscience)'
-  Write-Host '  - Custo: ~34× mais barato que Opus (pre-pago)'
+  Write-Host 'Trocar de modelo:' -ForegroundColor White
+  Write-Host '  /model fable       dentro da sessao -> V4 Pro   (/model sonnet volta)' -ForegroundColor Cyan
+  Write-Host '  deepclaude --pro   sessao inteira no V4 Pro' -ForegroundColor Cyan
   Write-Host ''
-  Write-Host 'Se o Claude original parar de funcionar:' -ForegroundColor White
-  Write-Host '  As instalacoes sao isoladas por env vars — a original nao foi alterada.'
-  Write-Host "  Se precisar reverter: apague $ConfigDir e $LauncherPath"
+  Write-Host '  O padrao e o flash de proposito: o alias serve o build 0731, focado em'
+  Write-Host '  uso de ferramenta, e os sub-indices independentes da OpenRouter dao'
+  Write-Host '  agentic 48,4 (flash) x 37,8 (pro) - por 1/3 do preco.'
+  Write-Host ''
+  Write-Host 'Limitacoes (vs Claude oficial):' -ForegroundColor White
+  Write-Host '  - Sem visao - imagem/PDF NAO dao erro, voltam como placeholder' -ForegroundColor Yellow
+  Write-Host '    (HTTP 200 com resposta errada e pior que falha)'
+  Write-Host '  - Sem MCP remoto (server-side); MCP local/stdio funciona'
+  Write-Host '  - Sem ZDR - NUNCA use com codigo sensivel/corporativo' -ForegroundColor Red
+  Write-Host '  - Alucina mais que o Claude (~94% no AA-Omniscience), inclusive sobre a'
+  Write-Host '    propria identidade: nao pergunte a ele qual modelo ele e'
+  Write-Host ''
+  Write-Host 'Custo:' -ForegroundColor White
+  Write-Host '  flash US$ 0,14 entrada / US$ 0,28 saida por M  |  pro US$ 0,435 / 0,87'
+  Write-Host '  ATENCAO: a DeepSeek passa a cobrar por horario em 2026-08-16 16:00 UTC' -ForegroundColor Yellow
+  Write-Host '    (peak 01:00-04:00 e 06:00-10:00 UTC; cache hit fica 6-12x mais caro)'
+  Write-Host '  O total_cost_usd que o Claude Code reporta e inutil aqui (usa a tabela da'
+  Write-Host '  Anthropic e erra ~12x). Custo real e o saldo em /user/balance.'
+  Write-Host ''
+  Write-Host 'Isolamento:' -ForegroundColor White
+  Write-Host '  O binario `claude` e compartilhado; o desvio e so por env var DENTRO do'
+  Write-Host '  launcher (que usa setlocal, entao nada vaza para a sua sessao do cmd).'
+  Write-Host '  A instalacao original do Claude Code nao foi alterada.'
+  Write-Host "  Reverter: apague $ConfigDir e $LauncherPath"
   Write-Host ''
 }
 
@@ -437,7 +537,7 @@ function Write-Summary {
 Write-Host ''
 Write-Host '╔══════════════════════════════════════════════════════╗' -ForegroundColor Cyan
 Write-Host '║  install-deepclaude.ps1                             ║' -ForegroundColor Cyan
-Write-Host '║  Claude Code + DeepSeek V4 Pro — Windows Native     ║' -ForegroundColor Cyan
+Write-Host '║  Claude Code + DeepSeek — Windows Native            ║' -ForegroundColor Cyan
 Write-Host '╚══════════════════════════════════════════════════════╝' -ForegroundColor Cyan
 Write-Host ''
 

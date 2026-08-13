@@ -32,11 +32,21 @@ set -uo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-info()    { printf "${BLUE}ℹ${NC} %s\n" "$*"; }
-ok()      { printf "${GREEN}✓${NC} %s\n" "$*"; }
+# 🔴 TODO log vai para STDERR — não é estilo, é correção de bug.
+# Funções como `resolve_deepseek_key` devolvem valor por stdout e são chamadas em
+# `$( )`. Enquanto info/ok/header escreviam em stdout, a substituição capturava
+# a MENSAGEM junto com o valor: a chave virava "\033[0;32m✓\033[0m Chave via
+# env\nsk-..." e ia inteira no header Authorization → 401 em todos os caminhos.
+# Pior, `save_deepseek_key` gravava isso no arquivo e o launcher lê `head -n1`,
+# ou seja pegava a linha da MENSAGEM. E no modo interativo o próprio prompt era
+# capturado, então a pergunta não aparecia e o script parecia travado.
+# Regra: se a função devolve valor por stdout, nada mais pode escrever lá.
+info()    { printf "${BLUE}ℹ${NC} %s\n" "$*" >&2; }
+ok()      { printf "${GREEN}✓${NC} %s\n" "$*" >&2; }
 warn()    { printf "${YELLOW}⚠${NC} %s\n" "$*" >&2; }
 err()     { printf "${RED}✗${NC} %s\n" "$*" >&2; }
-header()  { printf "\n${BOLD}${CYAN}═══ %s ═══${NC}\n" "$*"; }
+header()  { printf "\n${BOLD}${CYAN}═══ %s ═══${NC}\n" "$*" >&2; }
+say()     { printf "%b\n" "$*" >&2; }   # texto livre (resumo final)
 
 # ── Detecção de SO ──────────────────────────────────────────────────────────
 detect_os() {
@@ -128,23 +138,29 @@ check_prereqs() {
 find_or_install_claude() {
   header 'Binário Claude Code'
 
-  # Já existe?
+  # Já existe? Então NÃO mexemos: nada de reinstalar, atualizar ou trocar de
+  # canal. O deepclaude compartilha o MESMO binário e se isola por env var —
+  # instalar por cima só arriscaria quebrar a instalação que já funciona.
   if command -v claude &>/dev/null; then
     local claude_path
     claude_path="$(command -v claude)"
     local claude_version
     claude_version="$(claude --version 2>/dev/null || echo 'desconhecida')"
     ok "Claude Code encontrado: ${claude_path} (${claude_version})"
+    info "Mantido como está — o deepclaude reusa este binário e se isola por CLAUDE_CONFIG_DIR."
     printf '%s' "$claude_path"
     return 0
   fi
 
   info "Claude Code não encontrado. Instalando..."
 
+  # ⚠️ A saída dos instaladores vai para STDERR: esta função devolve o caminho
+  # do binário por stdout e é chamada em $( ). Sem o redirecionamento, o log do
+  # curl/npm entraria no valor capturado.
   # Opção 1: Instalador oficial (Linux/macOS)
   if [[ "$OS" == 'linux' || "$OS" == 'macos' ]]; then
     info "Tentando instalador oficial (claude.ai/install.sh)..."
-    if curl -fsSL https://claude.ai/install.sh | bash; then
+    if curl -fsSL https://claude.ai/install.sh | bash >&2; then
       if command -v claude &>/dev/null; then
         ok "Claude Code instalado via instalador oficial"
         printf '%s' "$(command -v claude)"
@@ -170,7 +186,7 @@ find_or_install_claude() {
   fi
 
   info "Instalando @anthropic-ai/claude-code via npm..."
-  if npm i -g @anthropic-ai/claude-code; then
+  if npm i -g @anthropic-ai/claude-code >&2; then
     if command -v claude &>/dev/null; then
       ok "Claude Code instalado via npm"
       printf '%s' "$(command -v claude)"
@@ -216,10 +232,11 @@ resolve_deepseek_key() {
 
   # 4. Prompt interativo
   if [[ -t 0 ]]; then
-    printf '\n'
+    printf '\n' >&2
     info "Chave da API DeepSeek necessária."
     info "Obtenha uma em: https://platform.deepseek.com/api_keys"
-    printf "${BOLD}Chave (sk-...):${NC} "
+    # Prompt em stderr: em stdout ele seria capturado pelo $( ) e ficaria invisível.
+    printf "${BOLD}Chave (sk-...):${NC} " >&2
     IFS= read -r key
     if [[ -z "$key" ]]; then
       err "Nenhuma chave fornecida. Abortando."
@@ -252,21 +269,26 @@ validate_deepseek_key() {
 
   case "$http_code" in
     200)
-      local is_active currency balance
-      is_active="$(printf '%s' "$body" | grep -o '"is_active"[[:space:]]*:[[:space:]]*true' || true)"
-      currency="$(printf '%s' "$body" | grep -o '"currency"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 || true)"
-      balance="$(printf '%s' "$body" | grep -o '"total_balance"[[:space:]]*:[[:space:]]*[0-9.]*' || true)"
+      # O campo é `is_available` (não `is_active`) e `total_balance` vem como
+      # STRING entre aspas — as duas coisas foram conferidas contra a resposta
+      # real: {"is_available":true,"balance_infos":[{"currency":"USD",
+      #        "total_balance":"3.80","granted_balance":"0.00",...}]}
+      local available currency balance
+      available="$(printf '%s' "$body" | grep -o '"is_available"[[:space:]]*:[[:space:]]*\(true\|false\)' | grep -o '\(true\|false\)$' || true)"
+      currency="$(printf '%s' "$body" | grep -o '"currency"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"' || true)"
+      balance="$(printf '%s' "$body" | grep -o '"total_balance"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"' || true)"
 
-      if [[ -n "$is_active" ]]; then
-        ok "Chave válida ✓"
-        if [[ -n "$balance" ]]; then
-          local bal_num; bal_num="$(printf '%s' "$balance" | grep -o '[0-9.]*$')"
-          local cur_str; cur_str="$(printf '%s' "$currency" | grep -o '"[^"]*"$' | tr -d '"')"
-          info "Saldo: ${cur_str:-USD} ${bal_num:-?}"
-        fi
-        return 0
+      ok "Chave válida — autenticou no endpoint de saldo"
+      [[ -n "$balance" ]] && info "Saldo: ${currency:-USD} ${balance}"
+
+      # Chave boa + carteira vazia é um estado REAL e confuso: o install passa,
+      # mas toda chamada ao modelo devolve 402 Insufficient Balance. Vale avisar
+      # aqui, senão o usuário culpa a instalação.
+      if [[ "$available" == 'false' ]]; then
+        warn "A chave funciona, mas a carteira está SEM SALDO (is_available: false)."
+        warn "O deepclaude vai subir e devolver 'API Error: 402 Insufficient Balance'"
+        warn "em toda chamada até você recarregar em https://platform.deepseek.com"
       fi
-      warn "Resposta 200 mas campo is_active ausente — prosseguindo..."
       return 0
       ;;
     401)
@@ -274,6 +296,13 @@ validate_deepseek_key() {
       err "Verifique se a chave está correta e não expirou."
       err "Obtenha uma nova em: https://platform.deepseek.com/api_keys"
       return 1
+      ;;
+    402)
+      # 402 != 401 e a diferença importa: a chave foi ACEITA, falta é saldo.
+      warn "402 Insufficient Balance — a chave é VÁLIDA, o que falta é saldo."
+      info "Recarregue em: https://platform.deepseek.com/top_up"
+      info "A instalação continua; o deepclaude só vai responder após a recarga."
+      return 0
       ;;
     403)
       err "Acesso negado (403). A conta pode estar suspensa ou sem saldo."
@@ -292,13 +321,28 @@ validate_deepseek_key() {
   esac
 }
 
+sanitize_key() {
+  # Remove CR (arquivo salvo no Windows), espaços nas pontas e qualquer coisa
+  # após a primeira linha. O launcher lê com `head -n1`, então uma chave com
+  # lixo na frente falharia com 401 sem explicar o porquê.
+  printf '%s' "$1" | head -n1 | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 save_deepseek_key() {
   local dir="$1" key="$2"
 
   mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
   printf '%s\n' "$key" > "$dir/deepseek.key"
   chmod 600 "$dir/deepseek.key"
   ok "Chave salva em $dir/deepseek.key (chmod 600)"
+
+  # Sanity check: o launcher vai ler exatamente isto.
+  local readback; readback="$(head -n1 "$dir/deepseek.key")"
+  if [[ "$readback" != "$key" ]]; then
+    err "O que foi gravado não bate com a chave fornecida — abortando para não deixar instalação quebrada."
+    exit 1
+  fi
 }
 
 # ── Configuração do diretório isolado ───────────────────────────────────────
@@ -402,18 +446,79 @@ create_launcher() {
 
   local launcher; launcher="$(launcher_path)"
 
-  case "$OS" in
-    windows-gitbash)
-      # Windows Git Bash: script bash simples
-      cat > "$launcher" << 'DEEPCLAUDE_EOF'
+  # Um launcher só para todos os SOs — as duas versões anteriores eram idênticas
+  # exceto por um comentário, e duas cópias da lista de pins é justamente como
+  # nasce um pin faltando.
+  cat > "$launcher" << 'DEEPCLAUDE_EOF'
 #!/usr/bin/env bash
-# deepclaude — Claude Code com backend DeepSeek V4 Pro
-# Gerado por install-deepclaude.sh — não edite manualmente.
+# deepclaude — Claude Code oficial com o cérebro do DeepSeek.
+# Gerado por install-deepclaude.sh — rode o instalador de novo para atualizar.
+#
+# ── Política de modelo ──────────────────────────────────────────────────────
+# Padrão: deepseek-v4-flash[1m]  ·  slot `fable`: deepseek-v4-pro[1m]
+#
+# Parece invertido e não é: nesta API o NOME não versiona, o ALIAS rola. O
+# `deepseek-v4-flash` serve hoje o build 0731 (31/07/2026, re-pós-treino para
+# uso de ferramenta) e o `deepseek-v4-pro` serve o 0813 (GA de 12/08/2026).
+# Para trabalho de agente de terminal o flash é a escolha melhor E mais barata:
+#   Terminal Bench 2.1 . 82,7 (flash) — e os sub-índices independentes da
+#   OpenRouter dão agentic 48,4 (flash) x 37,8 (pro), coding 69,1 x 59,4.
+#   Preço . flash US$ 0,14/0,28 por M   x   pro US$ 0,435/0,87 por M.
+# O pro fica a um comando: `/model fable` DENTRO da sessão (volta com
+# `/model sonnet`), ou `deepclaude --pro` para a sessão inteira.
+#
+# 🔴 Nomes que NÃO existem nesta API (dão HTTP 400): `deepseek-v4-flash-0731`,
+# `deepseek-v4-pro-0813`, `deepseek/deepseek-*`. Os dois últimos são strings do
+# OpenRouter — lá o alias simples entrega a versão de ABRIL. Só valem
+# `deepseek-v4-flash` e `deepseek-v4-pro`, com `[1m]` opcional.
 set -euo pipefail
 
-CONFIG_DIR="${HOME}/.claude-deepseek"
-DSKEY="${DEEPSEEK_CLAUDE_API_KEY:-}"
+CONFIG_DIR="${DEEPCLAUDE_DIR:-$HOME/.claude-deepseek}"
+MODEL="${DEEPCLAUDE_MODEL:-deepseek-v4-flash[1m]}"
+FABLE="${DEEPCLAUDE_FABLE_MODEL:-deepseek-v4-pro[1m]}"
+BASE_URL="${DEEPCLAUDE_BASE_URL:-https://api.deepseek.com/anthropic}"
+# O CLI não reconhece `deepseek-*` como modelo Claude e assumiria 200k de
+# janela, disparando auto-compact a 1/5 do que o modelo aguenta. A doc oficial
+# (code.claude.com/docs/en/context-window) manda declarar a janela real aqui.
+CTX="${DEEPCLAUDE_MAX_CONTEXT_TOKENS:-1048576}"
 
+# --pro: sobe a sessão inteira no V4 Pro. Consumido antes do --help para não
+# vazar como argumento do `claude`.
+if [ "${1:-}" = "--pro" ]; then
+  shift
+  MODEL="deepseek-v4-pro[1m]"
+  echo "deepclaude: sessão no deepseek-v4-pro" >&2
+fi
+HAIKU="${DEEPCLAUDE_HAIKU_MODEL:-$MODEL}"
+
+case "${1:-}" in
+  -h|--help)
+    cat <<EOF
+deepclaude — Claude Code com o cérebro do DeepSeek
+
+  deepclaude [args do claude]
+  deepclaude --pro [args]        sessão inteira no V4 Pro
+
+Dentro da sessão:
+  /model fable                   troca para o V4 Pro
+  /model sonnet                  volta para o V4 Flash
+
+Ambiente (todos opcionais):
+  DEEPCLAUDE_DIR                 dir de config  (default: ~/.claude-deepseek)
+  DEEPCLAUDE_API_KEY             chave DeepSeek (default: <dir>/deepseek.key)
+  DEEPCLAUDE_MODEL               modelo principal
+  DEEPCLAUDE_FABLE_MODEL         modelo do slot fable
+  DEEPCLAUDE_BASE_URL            endpoint
+
+Saldo:  curl -s https://api.deepseek.com/user/balance \\
+          -H "Authorization: Bearer \$(head -n1 \$DEEPCLAUDE_DIR/deepseek.key)"
+EOF
+    exit 0 ;;
+esac
+
+# Chave: env explícita vence o arquivo. DEEPSEEK_CLAUDE_API_KEY é mantida por
+# compatibilidade com instalações anteriores a 2026-08-13.
+DSKEY="${DEEPCLAUDE_API_KEY:-${DEEPSEEK_CLAUDE_API_KEY:-}}"
 if [ -z "$DSKEY" ] && [ -r "$CONFIG_DIR/deepseek.key" ]; then
   DSKEY="$(head -n1 "$CONFIG_DIR/deepseek.key")"
 fi
@@ -421,61 +526,31 @@ fi
 if [ -z "$DSKEY" ]; then
   echo "deepclaude: sem chave da API DeepSeek." >&2
   echo "Grave a chave em ${CONFIG_DIR}/deepseek.key (chmod 600)" >&2
-  echo "ou exporte DEEPSEEK_CLAUDE_API_KEY" >&2
+  echo "ou exporte DEEPCLAUDE_API_KEY" >&2
   exit 1
 fi
 
-exec env \
+# `env -u ANTHROPIC_API_KEY`: REMOVE a variável em vez de esvaziá-la. O
+# ANTHROPIC_AUTH_TOKEN já vence a API_KEY na precedência oficial, mas se o
+# usuário tiver uma ANTHROPIC_API_KEY exportada no shell, removê-la elimina a
+# ambiguidade de "chave vazia" de vez.
+# A env é prefixada ao comando: existe só neste processo, nada vaza pro shell.
+exec env -u ANTHROPIC_API_KEY \
   CLAUDE_CONFIG_DIR="$CONFIG_DIR" \
-  ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic' \
+  ANTHROPIC_BASE_URL="$BASE_URL" \
   ANTHROPIC_AUTH_TOKEN="$DSKEY" \
-  ANTHROPIC_MODEL='deepseek-v4-pro' \
-  ANTHROPIC_DEFAULT_OPUS_MODEL='deepseek-v4-pro' \
-  ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek-v4-pro' \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek-v4-pro' \
+  ANTHROPIC_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$HAIKU" \
+  ANTHROPIC_DEFAULT_FABLE_MODEL="$FABLE" \
+  CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX" \
   claude --dangerously-skip-permissions --effort max "$@"
 DEEPCLAUDE_EOF
-      chmod +x "$launcher"
-      ok "Launcher criado: $launcher"
-      ;;
 
-    *)
-      # Linux/macOS: script bash com env prefixada (nada vaza pro shell)
-      cat > "$launcher" << 'DEEPCLAUDE_EOF'
-#!/usr/bin/env bash
-# deepclaude — Claude Code com backend DeepSeek V4 Pro
-# Gerado por install-deepclaude.sh — não edite manualmente.
-# Para atualizar a config, rode install-deepclaude.sh novamente.
-set -euo pipefail
-
-CONFIG_DIR="${HOME}/.claude-deepseek"
-DSKEY="${DEEPSEEK_CLAUDE_API_KEY:-}"
-
-if [ -z "$DSKEY" ] && [ -r "$CONFIG_DIR/deepseek.key" ]; then
-  DSKEY="$(head -n1 "$CONFIG_DIR/deepseek.key")"
-fi
-
-if [ -z "$DSKEY" ]; then
-  echo "deepclaude: sem chave da API DeepSeek." >&2
-  echo "Grave a chave em ${CONFIG_DIR}/deepseek.key (chmod 600)" >&2
-  echo "ou exporte DEEPSEEK_CLAUDE_API_KEY" >&2
-  exit 1
-fi
-
-exec env \
-  CLAUDE_CONFIG_DIR="$CONFIG_DIR" \
-  ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic' \
-  ANTHROPIC_AUTH_TOKEN="$DSKEY" \
-  ANTHROPIC_MODEL='deepseek-v4-pro' \
-  ANTHROPIC_DEFAULT_OPUS_MODEL='deepseek-v4-pro' \
-  ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek-v4-pro' \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek-v4-pro' \
-  claude --dangerously-skip-permissions --effort max "$@"
-DEEPCLAUDE_EOF
-      chmod +x "$launcher"
-      ok "Launcher criado: $launcher"
-      ;;
-  esac
+  chmod +x "$launcher"
+  ok "Launcher criado: $launcher"
 }
 
 # ── Verificação de PATH ─────────────────────────────────────────────────────
@@ -530,35 +605,49 @@ test_installation() {
 
 # ── Resumo final ────────────────────────────────────────────────────────────
 print_summary() {
-  local cfg="$1" key="$2"
+  local cfg="$1"
 
   header 'Instalação concluída!'
 
-  printf '\n'
-  printf "${BOLD}Resumo:${NC}\n"
-  printf '  Comando:         ${CYAN}deepclaude${NC}\n'
-  printf '  Config dir:      ${CYAN}%s${NC}\n' "$cfg"
-  printf '  Chave:           ${CYAN}%s/deepseek.key${NC}\n' "$cfg"
-  printf '  Backend:         DeepSeek V4 Pro\n'
-  printf '  Endpoint:        https://api.deepseek.com/anthropic\n'
-  printf '\n'
-  printf "${BOLD}Próximos passos:${NC}\n"
-  printf '  1. Reinicie o terminal ou ajuste o PATH (veja acima)\n'
-  printf '  2. Rode: ${CYAN}deepclaude${NC}\n'
-  printf '  3. Na primeira execução, responda às perguntas de tema e trust\n'
-  printf '  4. Para adicionar skills globais, copie/links para %s/skills/\n' "$cfg"
-  printf '\n'
-  printf "${BOLD}Limitações (DeepSeek V4 Pro vs Claude oficial):${NC}\n"
-  printf '  - Sem visão (imagens/PDFs são degradados silenciosamente)\n'
-  printf '  - Sem MCP remoto (server-side); MCP local/stdio funciona\n'
-  printf '  - Sem ZDR (Zero Data Retention) — ${RED}nunca use com código sensível${NC}\n'
-  printf '  - Propenso a alucinações (~94%% no benchmark AA-Omniscience)\n'
-  printf '  - Custo: ~34× mais barato que Opus (pré-pago)\n'
-  printf '\n'
-  printf "${BOLD}Se o Claude original parar de funcionar:${NC}\n"
-  printf '  As instalações são isoladas por env vars — a original não foi alterada.\n'
-  printf '  Se precisar reverter: apague %s e o launcher em %s\n' "$cfg" "$(launcher_path)"
-  printf '\n'
+  say ""
+  say "${BOLD}Resumo:${NC}"
+  say "  Comando:      ${CYAN}deepclaude${NC}"
+  say "  Config dir:   ${CYAN}${cfg}${NC}   ${BOLD}(isolado — a instalação original do Claude não foi tocada)${NC}"
+  say "  Chave:        ${CYAN}${cfg}/deepseek.key${NC}"
+  say "  Endpoint:     https://api.deepseek.com/anthropic"
+  say "  Modelo:       ${CYAN}deepseek-v4-flash[1m]${NC}  (slot fable: ${CYAN}deepseek-v4-pro[1m]${NC})"
+  say ""
+  say "${BOLD}Próximos passos:${NC}"
+  say "  1. Reinicie o terminal ou ajuste o PATH (veja acima)"
+  say "  2. Rode: ${CYAN}deepclaude${NC}"
+  say "  3. Na primeira execução responda tema e trust (não há /login — o token dispensa)"
+  say ""
+  say "${BOLD}Trocar de modelo:${NC}"
+  say "  ${CYAN}/model fable${NC}     dentro da sessão → V4 Pro   (${CYAN}/model sonnet${NC} volta)"
+  say "  ${CYAN}deepclaude --pro${NC} sessão inteira no V4 Pro"
+  say ""
+  say "  O padrão é o ${BOLD}flash${NC} de propósito: o alias serve o build 0731, focado em uso"
+  say "  de ferramenta, e os sub-índices independentes da OpenRouter dão agentic"
+  say "  48,4 (flash) × 37,8 (pro) — por 1/3 do preço. O pro brilha em codegen puro."
+  say ""
+  say "${BOLD}Limitações (vs Claude oficial):${NC}"
+  say "  - ${YELLOW}Sem visão${NC} — imagem/PDF NÃO dão erro, voltam como placeholder (HTTP 200"
+  say "    com resposta errada é pior que falha; não confie em try/catch)"
+  say "  - Sem MCP remoto (server-side); MCP local/stdio funciona normalmente"
+  say "  - ${RED}Sem ZDR — nunca use com código sensível/corporativo${NC}"
+  say "  - Alucina mais que o Claude (~94% de propensão no AA-Omniscience), inclusive"
+  say "    sobre a própria identidade: não pergunte a ele qual modelo ele é"
+  say ""
+  say "${BOLD}Custo:${NC}"
+  say "  flash US\$ 0,14 entrada / US\$ 0,28 saída por M  ·  pro US\$ 0,435 / 0,87"
+  say "  ${YELLOW}⚠ A DeepSeek passa a cobrar por horário em 2026-08-16 16:00 UTC${NC}"
+  say "    (peak 01:00-04:00 e 06:00-10:00 UTC; cache hit fica 6-12× mais caro)"
+  say "  O ${BOLD}total_cost_usd${NC} que o Claude Code reporta é inútil aqui — ele usa a tabela"
+  say "  de preço da Anthropic e chega a errar ~12×. Custo real é o saldo:"
+  say "    ${CYAN}curl -s https://api.deepseek.com/user/balance -H \"Authorization: Bearer \\\$(head -n1 ${cfg}/deepseek.key)\"${NC}"
+  say ""
+  say "${BOLD}Desinstalar:${NC}  rm -rf ${cfg} $(launcher_path)"
+  say ""
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -592,13 +681,11 @@ main() {
     esac
   done
 
-  printf '\n'
-  printf "${BOLD}${CYAN}"
-  printf '╔══════════════════════════════════════════════════════╗\n'
-  printf '║  install-deepclaude.sh                              ║\n'
-  printf '║  Claude Code + DeepSeek V4 Pro — Cross-Platform     ║\n'
-  printf '╚══════════════════════════════════════════════════════╝'
-  printf "${NC}\n"
+  say ""
+  say "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗"
+  say "║  install-deepclaude.sh                               ║"
+  say "║  Claude Code + DeepSeek — instalação isolada         ║"
+  say "╚══════════════════════════════════════════════════════╝${NC}"
 
   # 1. Detect OS
   OS="$(detect_os)"
@@ -619,7 +706,11 @@ main() {
     warn "Modo --no-key: pulando configuração da chave."
     info "Você precisará configurar a chave manualmente para usar o deepclaude."
   else
-    DSKEY="$(resolve_deepseek_key "$CFG")"
+    DSKEY="$(sanitize_key "$(resolve_deepseek_key "$CFG")")"
+    if [[ -z "$DSKEY" ]]; then
+      err "Chave vazia após sanitização. Abortando."
+      exit 1
+    fi
     if validate_deepseek_key "$DSKEY"; then
       save_deepseek_key "$CFG" "$DSKEY"
     else
